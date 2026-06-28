@@ -30,6 +30,11 @@ from rag_pipeline import (
     load_vectorstore,
     create_llm,
     format_docs,
+    save_chunks_for_bm25,
+    load_chunks_for_bm25,
+    create_bm25_retriever,
+    hybrid_retrieval,
+    siliconflow_rerank,
 )
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -117,6 +122,9 @@ with st.sidebar:
 
             progress.progress(1.0, text=f"✅ 完成！共处理 {len(all_chunks)} 个文本块")
 
+            # Day 3: 保存分块供BM25使用
+            save_chunks_for_bm25(all_chunks)
+
             st.success(f"✅ 文档处理完成！共 {len(uploaded_files)} 个文件，{len(all_chunks)} 个文本块")
 
             # 保存vectorstore到session_state，方便后续检索
@@ -142,8 +150,26 @@ with st.sidebar:
     # 参数设置
     st.divider()
     st.subheader("⚙️ 检索参数")
+
+    # Day 3 新增：检索模式选择
+    retrieval_mode = st.radio(
+        "🔍 检索模式",
+        ["向量检索", "混合检索", "混合检索+重排序"],
+        index=0,
+        help="向量检索：语义理解 | 混合检索：向量+BM25关键词 | 混合+重排序：效果最好",
+    )
+
+    # 混合检索时的权重调节
+    if "混合" in retrieval_mode:
+        vector_weight = st.slider(
+            "向量检索权重",
+            min_value=0.0, max_value=1.0, value=0.6, step=0.1,
+            help="向量检索占比，BM25权重=1-向量权重。0.6表示向量占60%，BM25占40%",
+        )
+
     k_value = st.slider("检索文档块数量 (Top-K)", min_value=1, max_value=10, value=5,
-                         help="检索最相关的K个文档块，K越大上下文越多但可能引入噪声")
+                        help="检索最相关的K个文档块，K越大上下文越多但可能引入噪声")
+
 
 # ========== 主界面：问答区域 ==========
 
@@ -170,9 +196,6 @@ if vectorstore is None:
 def create_rag_components(_vectorstore, k):
     """
     创建RAG链路（缓存，避免每次提问都重建）
-    
-    注意：_vectorstore前面加_是因为Streamlit缓存机制，
-    不加_的参数变化时缓存会失效，加_的参数不参与缓存判断
     """
     llm = create_llm()
     retriever = _vectorstore.as_retriever(
@@ -217,25 +240,113 @@ question = st.text_input(
 # 提问按钮
 if question and st.button("🔍 提问", type="primary"):
     with st.spinner("正在检索和生成回答..."):
-        # 获取回答
-        answer = rag_chain.invoke(question)
 
-        # 获取来源文档
-        source_docs = retriever.invoke(question)
+        # ===== 根据检索模式获取文档 =====
+        if retrieval_mode == "向量检索":
+            # 模式1：纯向量检索（Day 1-2的方式）
+            source_docs = retriever.invoke(question)
+            hybrid_sources = [["向量"] for _ in source_docs]
+            reranked_scores = None
 
-    # 显示回答
+        elif retrieval_mode == "混合检索":
+            # 模式2：混合检索（向量 + BM25）
+            chunks = load_chunks_for_bm25()
+            bm25_search = create_bm25_retriever(chunks, k=k_value)
+            source_docs, hybrid_scores, hybrid_sources = hybrid_retrieval(
+                question, retriever, bm25_search, chunks,
+                vector_weight=vector_weight,
+                bm25_weight=1 - vector_weight,
+                k=k_value,
+            )
+            reranked_scores = None
+
+        elif retrieval_mode == "混合检索+重排序":
+            # 模式3：混合检索 + Jina重排序
+            chunks = load_chunks_for_bm25()
+            bm25_search = create_bm25_retriever(chunks, k=k_value)
+            source_docs, hybrid_scores, hybrid_sources = hybrid_retrieval(
+                question, retriever, bm25_search, chunks,
+                vector_weight=vector_weight,
+                bm25_weight=1 - vector_weight,
+                k=k_value * 2,  # 多取一些给重排序筛选
+            )
+            # Jina重排序
+            source_docs, reranked_scores = siliconflow_rerank(
+                question, source_docs, top_k=k_value
+            )
+            # 重排序后更新来源标记（截取前面的）
+            hybrid_sources = hybrid_sources[:k_value]
+
+        # ===== 用检索到的文档生成回答 =====
+        # 构造上下文
+        context_text = "\n\n".join(doc.page_content for doc in source_docs)
+
+        # 构建LCEL链路并调用
+        llm = create_llm()
+        prompt_template = """你是一个企业知识库问答助手。请严格基于以下参考文档来回答用户的问题。
+如果参考文档中没有相关信息，请直接回答"根据现有知识库，我无法回答这个问题"，不要编造内容。
+回答时请尽量完整、详细，并在回答末尾注明参考来源。
+
+参考文档：
+{context}
+
+用户问题：{question}
+
+请给出准确、完整的回答："""
+        QA_PROMPT = PromptTemplate(
+            template=prompt_template,
+            input_variables=["context", "question"],
+        )
+
+        # 执行生成
+        from langchain_core.runnables import RunnablePassthrough
+        from langchain_core.output_parsers import StrOutputParser
+
+        answer_chain = (
+            {"context": lambda x: x["context"], "question": lambda x: x["question"]}
+            | QA_PROMPT
+            | llm
+            | StrOutputParser()
+        )
+        answer = answer_chain.invoke({"context": context_text, "question": question})
+
+    # ===== 显示回答 =====
     st.subheader("💡 回答")
     st.markdown(answer)
 
-    # 显示引用来源
+    # ===== 显示检索模式信息 =====
+    st.subheader("📊 检索详情")
+    st.info(f"检索模式：**{retrieval_mode}** | 返回文档数：**{len(source_docs)}**")
+
+    # ===== 显示引用来源 =====
     st.subheader("📎 参考来源")
     for i, doc in enumerate(source_docs, 1):
         source = doc.metadata.get("source", "未知来源")
-        # 只显示文件名，不显示完整路径
         source_name = os.path.basename(source) if source != "未知来源" else source
 
-        with st.expander(f"来源 [{i}] - {source_name}"):
+        # 构造标签：来源 + 检索方式
+        tags = ""
+        if hybrid_sources and i <= len(hybrid_sources):
+            tags = f" | 检索方式: {'+'.join(hybrid_sources[i-1])}"
+        if reranked_scores and i <= len(reranked_scores):
+            tags += f" | 重排分: {reranked_scores[i-1]:.4f}"
+
+        with st.expander(f"来源 [{i}] - {source_name}{tags}"):
             st.text(doc.page_content)
+
+    # ===== 重排序分数表格 =====
+    if reranked_scores:
+        st.subheader("📈 重排序分数")
+        score_data = []
+        for i, (doc, score) in enumerate(zip(source_docs, reranked_scores), 1):
+            score_data.append({
+                "排名": i,
+                "重排分": f"{score:.4f}",
+                "内容预览": doc.page_content[:80] + "...",
+            })
+        st.table(score_data)
+
+# ... existing code ...
 
 # ========== 底部信息 ==========
 
